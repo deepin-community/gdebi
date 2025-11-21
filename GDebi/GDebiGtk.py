@@ -27,16 +27,12 @@ import logging
 import os
 import posix
 import re
+import subprocess
 import sys
 import time
 import tempfile
 import threading
-# py3 compat
-try:
-    from urllib import url2pathname
-    url2pathname  # pyflakes
-except ImportError:
-    from urllib.request import url2pathname
+from urllib.request import url2pathname
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -54,7 +50,7 @@ from gettext import gettext as _
 
 from .DebPackage import DebPackage
 from .SimpleGtkbuilderApp import SimpleGtkbuilderApp
-from .GDebiCommon import GDebiCommon, utf8
+from .GDebiCommon import GDebiCommon
 
 # the timeout when the termial is expanded if no activity from dpkg
 # is happening
@@ -142,8 +138,6 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         if file != "" and os.path.exists(file):
             self.open(file)
 
-        self.window_main.set_sensitive(True)
-
     def _show_busy_cursor(self, show_busy_cursor):
         win = self.window_main.get_window()
         if not win:
@@ -228,7 +222,61 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
             if path.endswith(".deb"):
                 self.open(path)
 
+    def _load_file_list_process(self, filenames):
+        err = 0
+        try:
+            for name in self._deb.control_filelist:
+                if name != "./":
+                    print(name, file=filenames, end='\0')
+            print(file=filenames, end='\0')
+            for name in self._deb.filelist:
+                if name != "./":
+                    print(name, file=filenames, end='\0')
+        except Exception as e:
+            logging.exception("Exception while reading the filelist: '%s'" % e)
+            err = 1
+        filenames.close()
+        return err
+
+    def _load_file_list_collect(self, condition, store, filenames):
+        if os.waitstatus_to_exitcode(condition) == 0:
+            store.clear()
+            header = store.append(None, [_("Package control data")])
+            filenames.seek(0)
+            for name in filenames.read()[:-1].split('\0'):
+                if name == "":
+                    header = store.append(None, [_("Upstream data")])
+                else:
+                    store.append(header, [name])
+            self.treeview_files.set_sensitive(True)
+        else:
+            store.clear()
+            store.append(None, [_("Error reading filelist")])
+        self.treeview_files.set_model(store)
+        self.treeview_files.expand_all()
+        filenames.close()
+
+    def _load_file_list(self):
+        filenames = os.fdopen(os.memfd_create('gdebi'), 'r+')
+        pid = os.fork()
+        if pid == 0:
+            os._exit(self._load_file_list_process(filenames))
+
+        store = Gtk.TreeStore(str)
+        self.treeview_files.set_sensitive(False)
+        store.append(None, [_("Reading filelist...")])
+        self.treeview_files.set_model(store)
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid,
+                             lambda _, condition: self._load_file_list_collect(condition, store, filenames))
+
     def open(self, filename, downloaded=False):
+        self.window_main.set_sensitive(False)
+        self.statusbar_main.push(self.context,_("Loading..."))
+        self._open(filename, downloaded)
+        self.statusbar_main.push(self.context, "")
+        self.window_main.set_sensitive(True)
+
+    def _open(self, filename, downloaded):
         self._show_busy_cursor(True)
         res = GDebiCommon.open(self, filename, downloaded)
         self._show_busy_cursor(False)
@@ -236,8 +284,6 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
             self.show_alert(
                 Gtk.MessageType.ERROR, self.error_header, self.error_body)
             return False
-
-        self.statusbar_main.push(self.context, "")
 
         # set window title
         self.window_main.set_title(_("Package Installer - %s") %
@@ -252,7 +298,7 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         buf = self.textview_description.get_buffer()
         try:
             long_desc = ""
-            raw_desc = utf8(self._deb["Description"]).split("\n")
+            raw_desc = self._deb["Description"].split("\n")
             # append a newline to the summary in the first line
             summary = raw_desc[0]
             raw_desc[0] = ""
@@ -289,26 +335,13 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
 
         # set various status bits
         self.label_version.set_text(self._deb["Version"])
-        self.label_maintainer.set_text(utf8(self._deb["Maintainer"]))
+        self.label_maintainer.set_text(self._deb["Maintainer"])
         self.label_priority.set_text(self._deb["Priority"])
-        self.label_section.set_text(utf8(self._deb["Section"]))
+        self.label_section.set_text(self._deb["Section"])
         self.label_size.set_text(self._deb["Installed-Size"] + " KiB")
 
         # set file list
-        store = Gtk.TreeStore(str)
-        try:
-            header = store.append(None, [_("Package control data")])
-            for name in self._deb.control_filelist:
-                store.append(header, [name])
-            header = store.append(None, [_("Upstream data")])
-            for name in self._deb.filelist:
-                store.append(header, [name])
-        except Exception as e:
-            logging.exception("Exception while reading the filelist: '%s'" % e)
-            store.clear()
-            store.append(None, [_("Error reading filelist")])
-        self.treeview_files.set_model(store)
-        self.treeview_files.expand_all()
+        self._load_file_list()
         # and the file content textview
         font_desc = Pango.FontDescription('monospace')
         self.textview_file_content.modify_font(font_desc)
@@ -603,12 +636,14 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
 
         if os.getuid() != 0:
             pkexec_cmd = "/usr/bin/pkexec"
-            pkexec_args = ["pkexec"]
             gdebi_args = ["gdebi-gtk", "--non-interactive",
                           self._deb.filename]
             if not install:
                 gdebi_args.append("--remove")
-            os.execv(pkexec_cmd, pkexec_args+gdebi_args)
+            self.window_main.close()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            sys.exit(subprocess.call([pkexec_cmd]+gdebi_args))
 
         if not self.try_acquire_lock():
             if install:
